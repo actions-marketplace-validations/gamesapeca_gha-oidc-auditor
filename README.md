@@ -18,7 +18,7 @@ However, adopting OIDC shifts the security perimeter from credential storage to 
 * **Overprivileged Trust Policies Grant Organization-Wide Access**: Cloud administrators frequently configure wildcard trust policies (`repo:my-org/*`), allowing any developer or compromised repository in the organization to assume production deployment roles.
 
 `gha-oidc-auditor` was created to solve these challenges by providing:
-1. **Deterministic Static Analysis**: Deep AST parsing of GitHub Actions workflows to identify OIDC privilege leaks, injection sinks, unpinned dependencies, and insecure trigger combinations before they reach production.
+1. **Deterministic Static Analysis**: Dual-layer AST parsing — combining structural workflow AST modeling with a dedicated zero-regex Lexer and recursive-descent Pratt Parser for GitHub Actions expression grammar (`${{ ... }}`) — resolving injection sinks, mutable actions, and privilege leaks with sub-microsecond determinism.
 2. **Context-Aware Evaluation Matrix**: Precise noise reduction that evaluates `if:` actor/repository conditions, distinguishes external attacker payloads from internal inputs, deduplicates repeated step occurrences, and recognizes cryptographic architectural exceptions (such as SLSA Framework generators).
 3. **Offensive Exploit Chains & Bug Bounty Mode**: Automated correlation of multi-condition zero-prerequisite attack paths with instant synthesis of submission-ready HackerOne/Bugcrowd Proof-of-Concept markdown reports.
 4. **Automated Least-Privilege Policy Synthesis**: Mathematical generation of strict Cloud Trust Policies for AWS IAM, GCP Workload Identity Federation, Azure Entra ID, HashiCorp Vault JWT, and Kubernetes ServiceAccounts scoped strictly to verified branches and environment approval gates.
@@ -145,20 +145,29 @@ make build
 ```
 
 
-## Usage
+## CLI Usage & Modular Subcommands
+
+`gha-oidc-auditor` can be executed directly using flags, or via dedicated, decoupled subcommands for specific automated pipelines:
+
+* `gha-oidc scan`: Audit local or remote workflows with parallel execution.
+* `gha-oidc policy verify`: Offline CIEM evaluation of existing cloud trust policies.
+* `gha-oidc policy generate`: Synthesize minimal-privilege cloud trust policies.
+* `gha-oidc hcl generate`: Generate Remediation-as-Code Terraform / OpenTofu modules.
 
 ### Local Workflow Audit
 
 Scan all workflows in `.github/workflows`:
 
 ```bash
+gha-oidc scan --path .github/workflows
+# Or direct execution:
 gha-oidc --path .github/workflows
 ```
 
 Scan a single workflow file:
 
 ```bash
-gha-oidc --path .github/workflows/deploy.yml
+gha-oidc scan --path .github/workflows/deploy.yml
 ```
 
 ### Remote Repository Audit
@@ -166,15 +175,30 @@ gha-oidc --path .github/workflows/deploy.yml
 Audit a remote repository using the GitHub API:
 
 ```bash
-gha-oidc --repo owner/repo --token $GITHUB_TOKEN
+gha-oidc scan --repo owner/repo --token $GITHUB_TOKEN
 ```
 
-### Organization-Wide Scan
+### Organization-Wide Scan (High-Concurrency)
 
-Scan all active repositories in an organization:
+Scan all active repositories in an organization concurrently across CPU cores:
 
 ```bash
-gha-oidc --org my-org --token $GITHUB_TOKEN --format markdown --output audit-report.md
+gha-oidc scan --org my-org --token $GITHUB_TOKEN --concurrency 8 --format markdown --output audit-report.md
+```
+
+### Enterprise Machine-Readable Output (JSON, NDJSON/JSONL, SARIF)
+
+`gha-oidc-auditor` supports multiple machine-readable formats for enterprise web dashboards, SIEM/SOAR platforms, data lakes, and GitHub Code Scanning:
+
+```bash
+# Full structured JSON tree (includes metadata, metrics, policies, and HCL)
+gha-oidc scan --path .github/workflows --format json --output report.json
+
+# Streaming Newline-Delimited JSON (NDJSON / JSONL) for Kafka, ELK, Splunk, BigQuery ingestion
+gha-oidc scan --path .github/workflows --format jsonl --output events.ndjson
+
+# OASIS SARIF v2.1.0 for GitHub Code Scanning / Security tab
+gha-oidc scan --path .github/workflows --format sarif --output results.sarif
 ```
 
 ### Bug Bounty Mode & PoC Generation
@@ -182,13 +206,13 @@ gha-oidc --org my-org --token $GITHUB_TOKEN --format markdown --output audit-rep
 Filter scan results exclusively for exploitable zero-prerequisite attack chains:
 
 ```bash
-gha-oidc --repo target-org/target-repo --token $GITHUB_TOKEN --bounty-mode
+gha-oidc scan --repo target-org/target-repo --token $GITHUB_TOKEN --bounty-mode
 ```
 
 Generate a submission-ready Bug Bounty Proof of Concept report:
 
 ```bash
-gha-oidc --repo target-org/target-repo --token $GITHUB_TOKEN --generate-poc --poc-output report.md
+gha-oidc scan --repo target-org/target-repo --token $GITHUB_TOKEN --generate-poc --poc-output report.md
 ```
 
 ### Least-Privilege Trust Policy Generation
@@ -196,7 +220,7 @@ gha-oidc --repo target-org/target-repo --token $GITHUB_TOKEN --generate-poc --po
 Generate scoped trust policies for AWS, GCP, or Azure based on detected workflow triggers and environments:
 
 ```bash
-gha-oidc --path .github/workflows --generate-policies
+gha-oidc policy generate --path .github/workflows
 ```
 
 Example generated AWS IAM Trust Policy:
@@ -228,10 +252,10 @@ Synthesize production-ready Terraform / OpenTofu `.tf` files directly for AWS IA
 
 ```bash
 # Output Terraform HCL to stdout
-gha-oidc --path .github/workflows --generate-hcl --format hcl
+gha-oidc hcl generate --path .github/workflows --format hcl
 
 # Write modular .tf files to infrastructure directory
-gha-oidc --path .github/workflows --generate-hcl --hcl-output ./terraform/modules/gha_oidc
+gha-oidc hcl generate --path .github/workflows --hcl-output ./terraform/modules/gha_oidc
 ```
 
 Example generated AWS IAM Terraform HCL module (with July 2026 immutable numeric IDs):
@@ -318,6 +342,39 @@ jobs:
           fail-on: critical
 ```
 
+#### GitHub Code Scanning (SARIF) Integration
+Export results directly into GitHub's Security tab using official SARIF v2.1.0 output:
+
+```yaml
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Run GHA OIDC Security Audit (SARIF)
+        run: |
+          go run ./cmd/gha-oidc --path .github/workflows --format sarif --output results.sarif --fail-on none
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+```
+
 ## Flags Reference
 
 | Flag | Shorthand | Default | Description |
@@ -326,7 +383,8 @@ jobs:
 | `--repo` | `-r` | `""` | Remote GitHub repository (`owner/repo`) |
 | `--org` | `-o` | `""` | GitHub organization name |
 | `--token` | `-t` | `$GITHUB_TOKEN` | GitHub API Personal Access Token |
-| `--format` | `-f` | `console` | Output format (`console`, `json`, `markdown`, `hcl`) |
+| `--format` | `-f` | `console` | Output format (`console`, `json`, `jsonl`, `ndjson`, `sarif`, `markdown`, `hcl`) |
+| `--concurrency` | `-c` | `runtime.NumCPU()` | Parallel workers for multi-workflow / multi-repo analysis |
 | `--fail-on` | | `critical` | Exit threshold (`critical`, `high`, `medium`, `all`, `none`) |
 | `--generate-policies` | | `false` | Synthesize least-privilege cloud trust policies (JSON) |
 | `--generate-hcl` | | `false` | Synthesize Remediation-as-Code Terraform / OpenTofu HCL modules |

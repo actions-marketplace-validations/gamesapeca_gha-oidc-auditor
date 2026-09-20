@@ -32,4 +32,9 @@ jobs:
         run: go test -v -race ./...
 
       - name: Build binary
-        run: go build -v ./cmd/gha-oidc
+        run: go build -v -o gha-oidc ./cmd/gha-oidc
+
+      - name: Dogfood security audit
+        run: |
+          chmod +x ./gha-oidc
+          ./gha-oidc scan --path .github/workflows --format console --fail-on high

@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"regexp"
 	"strings"
 )
 
@@ -60,60 +59,124 @@ var UntrustedContexts = []string{
 	"inputs.",
 }
 
-var (
-	// ExprRegex matches any ${{ ... }} expression, including multiline expressions.
-	ExprRegex = regexp.MustCompile(`\$\{\{((?s:.)*?)\}\}`)
-
-	// bracketIndexRegex matches ['property'] or ["property"] index expressions
-	bracketIndexRegex = regexp.MustCompile(`\[\s*['"]([a-zA-Z0-9_\-]+)['"]\s*\]`)
-
-	// dotSpaceRegex normalizes spaces around dots (e.g. "github . event" -> "github.event")
-	dotSpaceRegex = regexp.MustCompile(`\s*\.\s*`)
-)
-
 // NormalizeExpression transforms expressions into canonical dot-notation for invariant matching.
+// Converts bracket indexing (e.g. ['foo'] or ["foo"]) to .foo and normalizes whitespace around dots.
 func NormalizeExpression(expr string) string {
-	normalized := strings.ToLower(expr)
-	normalized = bracketIndexRegex.ReplaceAllString(normalized, ".$1")
-	normalized = dotSpaceRegex.ReplaceAllString(normalized, ".")
-	return normalized
+	s := strings.ToLower(expr)
+	var b strings.Builder
+	b.Grow(len(s))
+	n := len(s)
+	for i := 0; i < n; {
+		if s[i] == '[' {
+			j := i + 1
+			for j < n && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if j < n && (s[j] == '\'' || s[j] == '"') {
+				quote := s[j]
+				j++
+				start := j
+				for j < n && s[j] != quote {
+					j++
+				}
+				if j < n && s[j] == quote {
+					prop := s[start:j]
+					j++
+					for j < n && (s[j] == ' ' || s[j] == '\t') {
+						j++
+					}
+					if j < n && s[j] == ']' {
+						if b.Len() > 0 && !strings.HasSuffix(b.String(), ".") {
+							b.WriteByte('.')
+						}
+						b.WriteString(prop)
+						i = j + 1
+						continue
+					}
+				}
+			}
+		}
+
+		if s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n' {
+			k := i + 1
+			for k < n && (s[k] == ' ' || s[k] == '\t' || s[k] == '\r' || s[k] == '\n') {
+				k++
+			}
+			if k < n && s[k] == '.' {
+				i = k
+				continue
+			}
+			if b.Len() > 0 && strings.HasSuffix(b.String(), ".") {
+				i++
+				continue
+			}
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // ContainsUntrustedContext checks whether a shell run block contains inline untrusted context interpolation.
-// Handles case-insensitive expressions, bracket indexing, and nested functions (e.g. format, toJSON).
+// It parses extracted ${{ ... }} expressions into a concrete AST (via Lexer and ExpressionParser) and traverses
+// member/index access chains. String literals (e.g. 'github.event.issue.title') are formally excluded to prevent
+// false positives.
 func ContainsUntrustedContext(runBlock string) (bool, string) {
 	if runBlock == "" {
 		return false, ""
 	}
 
-	matches := ExprRegex.FindAllStringSubmatch(runBlock, -1)
-	for _, match := range matches {
-		if len(match) > 1 {
-			normalized := NormalizeExpression(match[1])
+	expressions := ExtractExpressions(runBlock)
+	for _, rawExpr := range expressions {
+		astNode, err := ParseExpression(rawExpr)
+		if err != nil {
+			// Fallback to normalized substring inspection on syntax error
+			normalized := NormalizeExpression(rawExpr)
 			for _, untrusted := range UntrustedContexts {
 				if strings.Contains(normalized, untrusted) {
 					return true, untrusted
 				}
 			}
+			continue
+		}
+
+		var matchedUntrusted string
+		found := false
+
+		WalkAST(astNode, func(n Node) bool {
+			if found {
+				return false
+			}
+
+			// Do not flag string literals
+			if _, isString := n.(*StringLiteralNode); isString {
+				return false
+			}
+
+			// Check if this node resolves to an untrusted context path
+			path, ok := ResolveContextPath(n)
+			if ok && path != "" {
+				for _, untrusted := range UntrustedContexts {
+					if path == untrusted || strings.HasPrefix(path, untrusted) || strings.Contains(path, untrusted) {
+						found = true
+						matchedUntrusted = untrusted
+						return false
+					}
+				}
+			}
+			return true
+		})
+
+		if found {
+			return true, matchedUntrusted
 		}
 	}
+
 	return false, ""
-}
-
-// ExtractExpressions extracts all interpolated expressions from a given block of text.
-func ExtractExpressions(content string) []string {
-	if content == "" {
-		return nil
-	}
-
-	var results []string
-	matches := ExprRegex.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		if len(match) > 1 {
-			results = append(results, strings.TrimSpace(match[1]))
-		}
-	}
-	return results
 }
 
 // IsExternalAttackerPayload returns true if the context variable is an externally-controllable event payload (issue, PR, comment, head_ref).
